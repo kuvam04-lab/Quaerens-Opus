@@ -1,0 +1,1172 @@
+"""
+Job monitor: polls company ATS APIs for entry-level chemical/process engineering roles
+and sends new postings to Discord and/or ntfy.sh.
+
+Usage:
+    python monitor.py                # run once
+    python monitor.py --notify-all   # notify on first run too (for testing)
+    python monitor.py --debug        # print every job seen, matched or not
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import sys
+import time
+import traceback
+from dataclasses import dataclass, asdict
+from pathlib import Path
+from typing import Iterable
+
+import requests
+
+from companies import COMPANIES, DEFAULT_SEARCH_TERMS
+
+SEEN_FILE = Path(__file__).parent / "seen_jobs.json"
+TIMEOUT = 25
+USER_AGENT = "JobMonitor/1.0 (personal use)"
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Job model + filtering
+# ──────────────────────────────────────────────────────────────────────────────
+
+@dataclass
+class Job:
+    company: str
+    title: str
+    location: str
+    url: str
+    posted: str
+    job_id: str
+
+    def key(self) -> str:
+        return f"{self.company}::{self.job_id}"
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Date parsing — each ATS returns posted-dates in a different format.
+# parse_posted_date() tries them all. Returns a UTC datetime or None.
+# ──────────────────────────────────────────────────────────────────────────────
+
+from datetime import datetime, timezone, timedelta
+
+
+def parse_posted_date(raw: str) -> datetime | None:
+    """Best-effort parsing of the heterogeneous 'posted' strings the various
+    ATSs return. Returns a timezone-aware UTC datetime, or None if unparseable.
+
+    Handles:
+      - ISO 8601 ("2026-04-21T15:30:00Z", "2026-04-21")
+      - Epoch seconds / milliseconds (as int or string of digits)
+      - Workday's "Posted X Days Ago" / "Posted Today" / "Posted Yesterday"
+      - SF RMK's "Mar 17, 2026"
+      - Avature's "21-04-2026" (DD-MM-YYYY)
+      - Phenom's "2026-04-21" or epoch ms
+    """
+    if not raw:
+        return None
+    s = str(raw).strip()
+    if not s:
+        return None
+    now = datetime.now(timezone.utc)
+
+    # Workday's relative phrasing
+    low = s.lower()
+    if "posted today" in low or low == "today":
+        return now
+    if "posted yesterday" in low or low == "yesterday":
+        return now - timedelta(days=1)
+    m = re.search(r"posted\s+(\d+)\+?\s+days?\s+ago", low)
+    if m:
+        return now - timedelta(days=int(m.group(1)))
+    m = re.search(r"posted\s+(\d+)\+?\s+months?\s+ago", low)
+    if m:
+        return now - timedelta(days=int(m.group(1)) * 30)
+
+    # Pure digits → epoch (seconds if 10 digits, milliseconds if 13)
+    if s.isdigit():
+        n = int(s)
+        if n > 10**12:        # ms
+            return datetime.fromtimestamp(n / 1000, tz=timezone.utc)
+        if n > 10**9:         # seconds
+            return datetime.fromtimestamp(n, tz=timezone.utc)
+
+    # ISO 8601 with optional Z
+    iso_candidates = [s, s.replace("Z", "+00:00")]
+    for cand in iso_candidates:
+        try:
+            dt = datetime.fromisoformat(cand)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt.astimezone(timezone.utc)
+        except ValueError:
+            pass
+
+    # Common explicit formats
+    formats = [
+        "%Y-%m-%d",
+        "%m/%d/%Y",
+        "%d/%m/%Y",
+        "%d-%m-%Y",            # Avature: 21-04-2026
+        "%b %d, %Y",           # SF RMK: Mar 17, 2026
+        "%B %d, %Y",           # March 17, 2026
+        "%Y/%m/%d",
+        "%Y-%m-%dT%H:%M:%S",
+    ]
+    for fmt in formats:
+        try:
+            return datetime.strptime(s, fmt).replace(tzinfo=timezone.utc)
+        except ValueError:
+            continue
+    return None
+
+
+def parse_age_filter(spec: str) -> timedelta | None:
+    """Parse user-friendly age strings: '24h', '1d', '7d', '2w', '30'.
+    Plain integers are interpreted as days. Returns None if invalid.
+    """
+    if not spec:
+        return None
+    s = spec.strip().lower()
+    m = re.fullmatch(r"(\d+)\s*([hdwm]?)", s)
+    if not m:
+        return None
+    n = int(m.group(1))
+    unit = m.group(2) or "d"   # default: days
+    return {
+        "h": timedelta(hours=n),
+        "d": timedelta(days=n),
+        "w": timedelta(weeks=n),
+        "m": timedelta(days=n * 30),
+    }[unit]
+
+
+# Title must contain one of these (case-insensitive, regex-friendly).
+INCLUDE_PATTERNS = [
+    r"\bprocess\s+engineer",
+    r"\bprocess\s+development\s+engineer",
+    r"\bchemical\s+engineer",
+    r"\brefining\s+engineer",
+    r"\bmidstream\s+engineer",
+    r"\bprocess\s+development\b",   # catches "Process Development Scientist I" etc.
+    r"\bmanufacturing\s+engineer",  # often used for chemE-style roles in pharma/semis
+]
+
+# Exclude these (senior signals + advanced levels).
+EXCLUDE_PATTERNS = [
+    r"\bsenior\b", r"\bsr\.?\b", r"\bprincipal\b", r"\bstaff\b",
+    r"\bmanager\b", r"\bdirector\b", r"\blead\b", r"\bexpert\b",
+    r"\b(ii|iii|iv|v)\b",                # Roman 2–5
+    r"\b(level\s*[2-9])\b",
+    r"\bengineer\s*[2-9]\b",             # "Engineer 2", "Engineer 3" ...
+    r"\bphd\b",
+    r"\bintern\b", r"\binternship\b", r"\bco-?op\b",
+    r"\bsales\b",
+]
+
+INCLUDE_RE = re.compile("|".join(INCLUDE_PATTERNS), re.IGNORECASE)
+EXCLUDE_RE = re.compile("|".join(EXCLUDE_PATTERNS), re.IGNORECASE)
+
+
+def title_matches(title: str) -> bool:
+    if not title:
+        return False
+    if EXCLUDE_RE.search(title):
+        return False
+    return bool(INCLUDE_RE.search(title))
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Fetchers — one per ATS
+# ──────────────────────────────────────────────────────────────────────────────
+
+class GreenhouseFetcher:
+    """Public Greenhouse job board API. Free, no auth."""
+
+    def fetch(self, cfg: dict) -> list[Job]:
+        slug = cfg["slug"]
+        url = f"https://boards-api.greenhouse.io/v1/boards/{slug}/jobs"
+        r = requests.get(url, timeout=TIMEOUT, headers={"User-Agent": USER_AGENT})
+        r.raise_for_status()
+        data = r.json()
+        jobs = []
+        for j in data.get("jobs", []):
+            jobs.append(Job(
+                company=cfg["display_name"],
+                title=j.get("title", ""),
+                location=(j.get("location") or {}).get("name", ""),
+                url=j.get("absolute_url", ""),
+                posted=j.get("updated_at", ""),
+                job_id=str(j.get("id", "")),
+            ))
+        return jobs
+
+
+class LeverFetcher:
+    """Public Lever postings API. Free, no auth."""
+
+    def fetch(self, cfg: dict) -> list[Job]:
+        slug = cfg["slug"]
+        url = f"https://api.lever.co/v0/postings/{slug}?mode=json"
+        r = requests.get(url, timeout=TIMEOUT, headers={"User-Agent": USER_AGENT})
+        r.raise_for_status()
+        data = r.json()
+        jobs = []
+        for j in data:
+            cats = j.get("categories", {}) or {}
+            location = cats.get("location", "")
+            if not location and isinstance(cats.get("allLocations"), list) and cats["allLocations"]:
+                location = cats["allLocations"][0]
+            jobs.append(Job(
+                company=cfg["display_name"],
+                title=j.get("text", ""),
+                location=location,
+                url=j.get("hostedUrl", ""),
+                posted=str(j.get("createdAt", "")),
+                job_id=j.get("id", ""),
+            ))
+        return jobs
+
+
+class AshbyFetcher:
+    """Public Ashby job board API. Free, no auth."""
+
+    def fetch(self, cfg: dict) -> list[Job]:
+        slug = cfg["slug"]
+        url = f"https://api.ashbyhq.com/posting-api/job-board/{slug}"
+        r = requests.get(url, timeout=TIMEOUT, headers={"User-Agent": USER_AGENT})
+        r.raise_for_status()
+        data = r.json()
+        jobs = []
+        for j in data.get("jobs", []):
+            jobs.append(Job(
+                company=cfg["display_name"],
+                title=j.get("title", ""),
+                location=j.get("location", ""),
+                url=j.get("jobUrl", ""),
+                posted=j.get("publishedAt", ""),
+                job_id=j.get("id", ""),
+            ))
+        return jobs
+
+
+class SuccessFactorsRMKFetcher:
+    """
+    Scrapes SAP SuccessFactors Recruiting Marketing (RMK) sites.
+    These have vanity careers domains (e.g. jobs.exxonmobil.com) but are
+    actually SF RMK underneath. Tells:
+      - cookie panel mentions "SAP as service provider"
+      - logos load from rmkcdn.successfactors.com
+      - listing URLs follow /go/{Category}/{NumericId}/
+      - paginate by inserting an offset: /go/{Category}/{ID}/{offset}/
+      - job detail URLs follow /{Company}/job/{Slug}/{NumericId}/
+
+    Config:
+      ats            : "rmk"
+      base_url       : "https://jobs.exxonmobil.com"  (no trailing slash)
+      category_paths : ["/go/Engineering/3845600/", ...]   (one or more)
+      country_filter : ["US"]   (optional; default keeps US + unknown locations)
+    """
+
+    PAGE_SIZE = 25
+    MAX_PAGES = 10  # safety cap = up to 250 jobs per category
+
+    def fetch(self, cfg: dict) -> list[Job]:
+        try:
+            from bs4 import BeautifulSoup
+        except ImportError:
+            print("  RMK fetcher needs beautifulsoup4: pip install beautifulsoup4")
+            return []
+
+        base = cfg["base_url"].rstrip("/")
+        category_paths = cfg.get("category_paths") or []
+        country_ok = [c.upper() for c in (cfg.get("country_filter") or ["US"])]
+        jobs: list[Job] = []
+        seen_urls: set[str] = set()
+
+        for cat_path in category_paths:
+            if not cat_path.endswith("/"):
+                cat_path += "/"
+            empty_streak = 0
+            for page in range(self.MAX_PAGES):
+                offset = page * self.PAGE_SIZE
+                if offset == 0:
+                    url = f"{base}{cat_path}?sortColumn=referencedate&sortDirection=desc"
+                else:
+                    url = f"{base}{cat_path}{offset}/?sortColumn=referencedate&sortDirection=desc"
+                try:
+                    r = requests.get(url, timeout=TIMEOUT,
+                                     headers={"User-Agent": USER_AGENT})
+                    if r.status_code != 200:
+                        break
+                except requests.RequestException as e:
+                    print(f"  RMK fetch failed for {cfg['display_name']}: {e}")
+                    break
+
+                soup = BeautifulSoup(r.text, "html.parser")
+                page_jobs = self._parse_page(soup, cfg, base, country_ok)
+                new_count = 0
+                for j in page_jobs:
+                    if j.url in seen_urls:
+                        continue
+                    seen_urls.add(j.url)
+                    jobs.append(j)
+                    new_count += 1
+                if new_count == 0:
+                    empty_streak += 1
+                    if empty_streak >= 2:
+                        break  # likely past the end
+                else:
+                    empty_streak = 0
+                time.sleep(0.5)
+        return jobs
+
+    def _parse_page(self, soup, cfg, base, country_ok) -> list[Job]:
+        out: list[Job] = []
+        seen = set()
+        # SF RMK renders results in a <table>; each <tr> has the job link in
+        # the first cell and metadata in the rest.
+        for row in soup.find_all("tr"):
+            link = row.find("a", href=lambda h: h and "/job/" in h)
+            if not link:
+                continue
+            href = link.get("href", "").strip()
+            title = link.get_text(strip=True)
+            if not href or not title:
+                continue
+            full_url = href if href.startswith("http") else base + href
+            # Strip query strings/anchors so the same job has one stable key
+            full_url = full_url.split("?")[0].split("#")[0]
+            if full_url in seen:
+                continue
+            seen.add(full_url)
+
+            cells = row.find_all("td")
+            location = cells[1].get_text(strip=True) if len(cells) > 1 else ""
+            posted = cells[4].get_text(strip=True) if len(cells) > 4 else ""
+
+            # Country filter — locations look like "Houston, TX, US" or
+            # "Bengaluru, KA, IN". Keep US (or whatever's allowed). Empty
+            # location → keep (better to over-notify than miss).
+            if location and country_ok:
+                tokens = [t.strip().upper() for t in location.split(",")]
+                if not any(tok in country_ok for tok in tokens):
+                    continue
+
+            # Job ID = trailing numeric segment of the URL
+            parts = [p for p in full_url.rstrip("/").split("/") if p]
+            job_id = parts[-1] if parts and parts[-1].isdigit() else full_url
+
+            out.append(Job(
+                company=cfg["display_name"],
+                title=title,
+                location=location,
+                url=full_url,
+                posted=posted,
+                job_id=str(job_id),
+            ))
+        return out
+
+
+class WorkdayFetcher:
+    """
+    Workday's public CXS endpoint. Most large pharma/oil/chemicals/defense use this.
+    Config requires:
+      - api_url:  e.g. "https://msd.wd5.myworkdayjobs.com/wday/cxs/msd/SearchJobs/jobs"
+      - base_url: e.g. "https://msd.wd5.myworkdayjobs.com/en-US/SearchJobs"
+                  (used to build clickable job links)
+    """
+
+    def fetch(self, cfg: dict) -> list[Job]:
+        api_url = cfg["api_url"]
+        base_url = cfg["base_url"].rstrip("/")
+        search_terms = cfg.get("search_terms", DEFAULT_SEARCH_TERMS)
+        seen_paths: set[str] = set()
+        jobs: list[Job] = []
+
+        for term in search_terms:
+            offset = 0
+            limit = 20
+            pages = 0
+            while pages < 6:  # safety cap: 120 results per term
+                body = {
+                    "limit": limit,
+                    "offset": offset,
+                    "searchText": term,
+                    "appliedFacets": {},
+                }
+                try:
+                    r = requests.post(
+                        api_url,
+                        json=body,
+                        timeout=TIMEOUT,
+                        headers={
+                            "Accept": "application/json",
+                            "Content-Type": "application/json",
+                            "User-Agent": USER_AGENT,
+                        },
+                    )
+                except requests.RequestException as e:
+                    print(f"  Workday request failed for {cfg['display_name']} ({term!r}): {e}")
+                    break
+                if r.status_code != 200:
+                    print(f"  Workday {cfg['display_name']} returned {r.status_code} for {term!r}")
+                    break
+                try:
+                    data = r.json()
+                except ValueError:
+                    break
+                postings = data.get("jobPostings", [])
+                if not postings:
+                    break
+                for p in postings:
+                    ext = p.get("externalPath", "")
+                    if not ext or ext in seen_paths:
+                        continue
+                    seen_paths.add(ext)
+                    job_url = base_url + ext if ext.startswith("/") else f"{base_url}/{ext}"
+                    jobs.append(Job(
+                        company=cfg["display_name"],
+                        title=p.get("title", ""),
+                        location=p.get("locationsText", ""),
+                        url=job_url,
+                        posted=p.get("postedOn", ""),
+                        job_id=ext.split("/")[-1] or ext,
+                    ))
+                if len(postings) < limit:
+                    break
+                offset += limit
+                pages += 1
+                time.sleep(0.4)
+            time.sleep(0.4)
+        return jobs
+
+
+class AvatureFetcher:
+    """
+    Scrapes Avature-hosted career sites. Avature is the platform behind, among
+    others, jobs.totalenergies.com. Tells:
+      - Template assets load from templates-static-assets.avacdn.net
+      - Pagination URLs use ?jobOffset=N&jobRecordsPerPage=20
+      - Each job is in an <h3> with an <a href="…/JobDetail/{slug}/{id}"> and a
+        following <ul> of metadata (date, country, position type, subsidiary).
+
+    Config:
+      ats             : "avature"
+      base_url        : "https://jobs.totalenergies.com"
+      search_path     : "/en_US/careers/SearchJobs"
+      country_filter  : ["US"]   (optional; default keeps US + unknown)
+                        Also accepts "United States" — the filter checks each
+                        comma- or slash-separated token.
+    """
+
+    PAGE_SIZE = 20
+    MAX_PAGES = 15  # safety cap = 300 jobs per company
+
+    # Tokens that match the user's country filter. Add aliases here.
+    COUNTRY_ALIASES = {
+        "US": {"US", "USA", "U.S.", "U.S.A.", "UNITED STATES", "UNITED STATES OF AMERICA"},
+    }
+
+    def fetch(self, cfg: dict) -> list[Job]:
+        try:
+            from bs4 import BeautifulSoup
+        except ImportError:
+            print("  Avature fetcher needs beautifulsoup4: pip install beautifulsoup4")
+            return []
+
+        base = cfg["base_url"].rstrip("/")
+        search_path = cfg.get("search_path") or "/en_US/careers/SearchJobs"
+        country_ok_codes = [c.upper() for c in (cfg.get("country_filter") or ["US"])]
+        country_ok = set()
+        for code in country_ok_codes:
+            country_ok.update(self.COUNTRY_ALIASES.get(code, {code}))
+
+        jobs: list[Job] = []
+        seen_urls: set[str] = set()
+        empty_streak = 0
+
+        for page in range(self.MAX_PAGES):
+            offset = page * self.PAGE_SIZE
+            sep = "&" if "?" in search_path else "?"
+            url = f"{base}{search_path}{sep}jobRecordsPerPage={self.PAGE_SIZE}&jobOffset={offset}"
+            try:
+                r = requests.get(url, timeout=TIMEOUT,
+                                 headers={"User-Agent": USER_AGENT})
+                if r.status_code != 200:
+                    print(f"  Avature {cfg['display_name']} returned {r.status_code}")
+                    break
+            except requests.RequestException as e:
+                print(f"  Avature fetch failed for {cfg['display_name']}: {e}")
+                break
+
+            soup = BeautifulSoup(r.text, "html.parser")
+            page_jobs = self._parse_page(soup, cfg, base, country_ok)
+            new_count = 0
+            for j in page_jobs:
+                if j.url in seen_urls:
+                    continue
+                seen_urls.add(j.url)
+                jobs.append(j)
+                new_count += 1
+            if new_count == 0:
+                empty_streak += 1
+                if empty_streak >= 2:
+                    break  # likely past the end (or all duplicates)
+            else:
+                empty_streak = 0
+            time.sleep(0.5)
+        return jobs
+
+    def _parse_page(self, soup, cfg, base, country_ok) -> list[Job]:
+        out: list[Job] = []
+        # Each job lives in an <h3> with a link to /JobDetail/.
+        for link in soup.find_all("a", href=lambda h: h and "/JobDetail/" in h):
+            title = link.get_text(strip=True)
+            href = link.get("href", "").strip()
+            if not title or not href:
+                continue
+            full_url = href if href.startswith("http") else base + href
+            full_url = full_url.split("?")[0].split("#")[0]
+
+            # Walk up to find a wrapping container, then look for the
+            # adjacent <ul> with metadata (date, country, type, subsidiary).
+            container = link.find_parent(["h3", "h2", "li", "article", "div"])
+            metadata: list[str] = []
+            ul = None
+            if container is not None:
+                ul = container.find_next_sibling("ul")
+                if ul is None:
+                    parent = container.find_parent()
+                    if parent is not None:
+                        ul = parent.find("ul")
+            if ul is not None:
+                metadata = [li.get_text(strip=True) for li in ul.find_all("li")]
+
+            posted = metadata[0] if len(metadata) > 0 else ""
+            location = metadata[1] if len(metadata) > 1 else ""
+
+            # Country filter — TotalEnergies-style locations can be
+            # "United States / US", "France", "Senegal", "United Arab Emirates".
+            if location and country_ok:
+                tokens = re.split(r"[,/]", location)
+                tokens = [t.strip().upper() for t in tokens if t.strip()]
+                if not any(tok in country_ok for tok in tokens):
+                    continue
+
+            # Job ID = trailing numeric segment of the JobDetail URL.
+            parts = [p for p in full_url.rstrip("/").split("/") if p]
+            job_id = parts[-1] if parts and parts[-1].isdigit() else full_url
+
+            out.append(Job(
+                company=cfg["display_name"],
+                title=title,
+                location=location,
+                url=full_url,
+                posted=posted,
+                job_id=str(job_id),
+            ))
+        return out
+
+
+class EightfoldFetcher:
+    """
+    Eightfold AI's public SmartApply JSON endpoint.
+    Used by: Northrop Grumman (jobs.northropgrumman.com → domain=ngc.com).
+
+    Config:
+      ats             : "eightfold"
+      base_url        : "https://jobs.northropgrumman.com"   (no trailing slash)
+      domain          : "ngc.com"      (passed to the API as ?domain=)
+      country_filter  : ["US"]   (optional; default keeps US + Remote + unknown)
+    """
+
+    PAGE_SIZE = 10           # Eightfold's default
+    MAX_PAGES = 30           # safety cap = 300 jobs per company
+
+    def fetch(self, cfg: dict) -> list[Job]:
+        base = cfg["base_url"].rstrip("/")
+        domain = cfg["domain"]
+        country_ok = [c.upper() for c in (cfg.get("country_filter") or ["US"])]
+        jobs: list[Job] = []
+        seen_ids: set[str] = set()
+
+        for page in range(self.MAX_PAGES):
+            start = page * self.PAGE_SIZE
+            url = (f"{base}/api/apply/v2/jobs?"
+                   f"domain={domain}&hl=en&start={start}&num={self.PAGE_SIZE}")
+            try:
+                r = requests.get(url, timeout=TIMEOUT,
+                                 headers={"Accept": "application/json",
+                                          "User-Agent": USER_AGENT})
+                if r.status_code != 200:
+                    print(f"  Eightfold {cfg['display_name']} returned {r.status_code}")
+                    break
+                data = r.json()
+            except (requests.RequestException, ValueError) as e:
+                print(f"  Eightfold fetch failed for {cfg['display_name']}: {e}")
+                break
+
+            positions = data.get("positions") or data.get("data", {}).get("positions", [])
+            if not positions:
+                break
+
+            for p in positions:
+                job_id = str(p.get("id") or p.get("display_job_id") or "")
+                if not job_id or job_id in seen_ids:
+                    continue
+                seen_ids.add(job_id)
+
+                title = p.get("name") or p.get("title") or ""
+                # Location can be string OR {city,state,country}; handle both.
+                loc = p.get("location") or ""
+                if isinstance(loc, dict):
+                    parts = [loc.get("city"), loc.get("state"), loc.get("country")]
+                    loc = ", ".join([x for x in parts if x])
+                country = (p.get("country") or "").upper()
+                if not country and isinstance(p.get("locations"), list) and p["locations"]:
+                    country = (p["locations"][0].get("country") or "").upper()
+
+                # Country filter — match either explicit `country` field or
+                # presence of the country code in the location string.
+                if country_ok:
+                    loc_upper = (loc or "").upper()
+                    keep = (country in country_ok) or any(
+                        c in loc_upper for c in country_ok + ["UNITED STATES", "USA"]
+                    ) or loc_upper.strip() == "" or "REMOTE" in loc_upper
+                    if not keep:
+                        continue
+
+                # Job URL
+                href = p.get("canonicalPositionUrl") or ""
+                if not href:
+                    href = f"{base}/careers/job/{job_id}?domain={domain}"
+
+                # Posted date
+                posted = ""
+                if p.get("t_create"):
+                    # epoch seconds
+                    try:
+                        from datetime import datetime, timezone
+                        posted = datetime.fromtimestamp(
+                            int(p["t_create"]), tz=timezone.utc
+                        ).strftime("%Y-%m-%d")
+                    except (ValueError, TypeError):
+                        posted = str(p.get("t_create"))
+
+                jobs.append(Job(
+                    company=cfg["display_name"],
+                    title=title,
+                    location=loc,
+                    url=href,
+                    posted=posted,
+                    job_id=job_id,
+                ))
+
+            if len(positions) < self.PAGE_SIZE:
+                break
+            time.sleep(0.4)
+        return jobs
+
+
+class PhenomFetcher:
+    """
+    Phenom People's public 'widgets' POST endpoint.
+    Used by: EMD/Merck KGaA (careers.emdgroup.com),
+             BAE Systems (jobs.baesystems.com).
+
+    The widgets endpoint requires a per-site refNum, which is a short code
+    embedded on the careers site. For EMD it's MQAEGZUS (visible in their
+    CDN URLs like cdn.phenompeople.com/CareerConnectResources/MQAEGZUS/).
+
+    Config:
+      ats             : "phenom"
+      display_name    : str
+      base_url        : "https://careers.emdgroup.com"   (no trailing slash)
+      ref_num         : "MQAEGZUS"
+      country_filter  : ["US"] | ["United States"]   (optional; default ["US"])
+      page_id         : "page20"     (optional; site-specific, default "page20")
+      lang            : "en_global"  (optional; default "en_global")
+    """
+
+    PAGE_SIZE = 20
+    MAX_PAGES = 15  # safety cap = 300 jobs per company
+
+    def fetch(self, cfg: dict) -> list[Job]:
+        base = cfg["base_url"].rstrip("/")
+        ref_num = cfg["ref_num"]
+        country_filter = cfg.get("country_filter") or ["US"]
+        # Phenom usually wants the full country name in the search filter:
+        # "United States". Translate "US" → "United States" by default.
+        country_ok = []
+        for c in country_filter:
+            if c.upper() == "US":
+                country_ok.append("United States")
+            else:
+                country_ok.append(c)
+        country_ok_upper = [c.upper() for c in country_ok]
+
+        page_id = cfg.get("page_id", "page20")
+        lang = cfg.get("lang", "en_global")
+        jobs: list[Job] = []
+        seen_ids: set[str] = set()
+
+        for page in range(self.MAX_PAGES):
+            payload = {
+                "lang": lang,
+                "deviceType": "desktop",
+                "country": "global",
+                "pageName": "search-results",
+                "size": self.PAGE_SIZE,
+                "from": page * self.PAGE_SIZE,
+                "jobs": True,
+                "counts": True,
+                "all_fields": ["category", "country", "city", "type"],
+                "clearAll": False,
+                "jdsource": "facets",
+                "isSliderEnable": False,
+                "pageId": page_id,
+                "siteType": "external",
+                "keywords": "",
+                "global": True,
+                "selected_fields": {},
+                "sort": {"order": "desc", "field": "postedDate"},
+                "locationData": {},
+                "refNum": ref_num,
+                "ddoKey": "refineSearch",
+            }
+            try:
+                r = requests.post(f"{base}/widgets", json=payload, timeout=TIMEOUT,
+                                  headers={"Content-Type": "application/json",
+                                           "Accept": "application/json",
+                                           "User-Agent": USER_AGENT})
+                if r.status_code != 200:
+                    print(f"  Phenom {cfg['display_name']} returned {r.status_code}")
+                    break
+                data = r.json()
+            except (requests.RequestException, ValueError) as e:
+                print(f"  Phenom fetch failed for {cfg['display_name']}: {e}")
+                break
+
+            # Response shape varies a bit by Phenom version. Look for an
+            # 'eagerLoadRefineSearch' or top-level 'refineSearch' or 'jobs'.
+            container = (data.get("eagerLoadRefineSearch")
+                         or data.get("refineSearch")
+                         or data)
+            jobs_list = container.get("data", {}).get("jobs", []) \
+                if isinstance(container.get("data"), dict) else container.get("jobs", [])
+            if not jobs_list:
+                break
+
+            for j in jobs_list:
+                job_id = str(j.get("jobId") or j.get("jobSeqNo") or j.get("id") or "")
+                if not job_id or job_id in seen_ids:
+                    continue
+                seen_ids.add(job_id)
+
+                title = j.get("title") or j.get("jobTitle") or ""
+                country = (j.get("country") or "").strip()
+                city = (j.get("city") or "").strip()
+                state = (j.get("state") or "").strip()
+                location = ", ".join([p for p in [city, state, country] if p])
+
+                # Country filter
+                if country_ok and country:
+                    if country.upper() not in country_ok_upper and \
+                       not any(c.upper() in country.upper() for c in country_ok):
+                        continue
+
+                href = j.get("jobURL") or j.get("ml_job_url") or ""
+                if href and not href.startswith("http"):
+                    href = base + href if href.startswith("/") else f"{base}/{href}"
+                if not href:
+                    href = f"{base}/job/{job_id}"
+
+                posted = j.get("postedDate") or j.get("postingDate") or ""
+
+                jobs.append(Job(
+                    company=cfg["display_name"],
+                    title=title,
+                    location=location,
+                    url=href,
+                    posted=posted,
+                    job_id=job_id,
+                ))
+
+            if len(jobs_list) < self.PAGE_SIZE:
+                break
+            time.sleep(0.4)
+        return jobs
+
+
+class CornerstoneFetcher:
+    """
+    Cornerstone OnDemand (CSOD) careers. Used by: Linde (linde.csod.com).
+
+    CSOD is a 2-step fetch:
+      1. GET the careers homepage HTML to extract a JWT token + cloud endpoint
+         (both are embedded in inline JS).
+      2. POST {cloud_endpoint}/rec-job-search/external/jobs with the token in
+         an Authorization header and a JSON payload of search filters.
+
+    Config:
+      ats             : "cornerstone"
+      display_name    : str
+      tenant          : "linde"          (the {tenant}.csod.com subdomain)
+      site_id         : 20               (numeric career site ID from URL)
+      country_filter  : ["US"]   (optional; default ["US"])
+
+    The site_id can be found in the URL after /careersite/, e.g.
+    https://linde.csod.com/ux/ats/careersite/20/home → site_id = 20.
+    """
+
+    PAGE_SIZE = 25
+    MAX_PAGES = 12  # safety cap = 300 jobs per company
+
+    # US country codes Cornerstone may use ("US", "USA", or numeric IDs vary).
+    # We post countryCodes=[] (no filter) and post-filter by location string.
+    US_LOCATION_TOKENS = {"US", "USA", "U.S.", "U.S.A.", "UNITED STATES",
+                          "UNITED STATES OF AMERICA"}
+
+    def fetch(self, cfg: dict) -> list[Job]:
+        tenant = cfg["tenant"]
+        site_id = int(cfg["site_id"])
+        country_ok = set()
+        for c in (cfg.get("country_filter") or ["US"]):
+            if c.upper() == "US":
+                country_ok.update(self.US_LOCATION_TOKENS)
+            else:
+                country_ok.add(c.upper())
+
+        token, cloud_endpoint = self._fetch_token(tenant, site_id)
+        if not token or not cloud_endpoint:
+            print(f"  Cornerstone {cfg['display_name']}: couldn't extract token")
+            return []
+
+        api_url = f"{cloud_endpoint.rstrip('/')}/rec-job-search/external/jobs"
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "Origin": f"https://{tenant}.csod.com",
+            "Referer": f"https://{tenant}.csod.com/",
+            "Csod-Accept-Language": "en-US",
+            "User-Agent": USER_AGENT,
+        }
+        jobs: list[Job] = []
+        seen_ids: set[str] = set()
+
+        for page in range(1, self.MAX_PAGES + 1):
+            payload = {
+                "careerSiteId": site_id,
+                "careerSitePageId": 1,
+                "pageNumber": page,
+                "pageSize": self.PAGE_SIZE,
+                "cultureId": 1,
+                "searchText": "",
+                "cultureName": "en-US",
+                "states": [],
+                "countryCodes": [],
+                "cities": [],
+                "placeID": "",
+                "radius": None,
+                "postingsWithinDays": None,
+                "customFieldCheckboxKeys": [],
+                "customFieldDropdowns": [],
+                "customFieldRadios": [],
+            }
+            try:
+                r = requests.post(api_url, json=payload, headers=headers, timeout=TIMEOUT)
+                if r.status_code != 200:
+                    print(f"  Cornerstone {cfg['display_name']} returned {r.status_code}")
+                    break
+                data = r.json()
+            except (requests.RequestException, ValueError) as e:
+                print(f"  Cornerstone fetch failed for {cfg['display_name']}: {e}")
+                break
+
+            requisitions = data.get("data", {}).get("requisitions", [])
+            if not requisitions:
+                break
+            total = data.get("data", {}).get("totalCount", 0)
+
+            for req in requisitions:
+                req_id = str(req.get("requisitionId") or req.get("id") or "")
+                if not req_id or req_id in seen_ids:
+                    continue
+                seen_ids.add(req_id)
+
+                title = req.get("title") or req.get("displayJobTitle") or ""
+                # Location: usually req["primaryLocation"] or req["locations"][0]
+                location = req.get("primaryLocation") or ""
+                if not location and isinstance(req.get("locations"), list) and req["locations"]:
+                    loc0 = req["locations"][0]
+                    if isinstance(loc0, dict):
+                        bits = [loc0.get("city"), loc0.get("state"), loc0.get("country")]
+                        location = ", ".join([x for x in bits if x])
+                    else:
+                        location = str(loc0)
+
+                # Country filter on location string
+                if country_ok and location:
+                    tokens = re.split(r"[,/]", location)
+                    tokens = [t.strip().upper() for t in tokens if t.strip()]
+                    if not any(t in country_ok for t in tokens):
+                        continue
+
+                # Job URL — best-effort; CSOD uses requisition IDs in the URL
+                href = (f"https://{tenant}.csod.com/ux/ats/careersite/{site_id}/"
+                        f"home/requisition/{req_id}?c={tenant}")
+
+                posted = req.get("postingStartDate") or ""
+
+                jobs.append(Job(
+                    company=cfg["display_name"],
+                    title=title,
+                    location=location,
+                    url=href,
+                    posted=posted,
+                    job_id=req_id,
+                ))
+
+            if len(jobs) >= total or len(requisitions) < self.PAGE_SIZE:
+                break
+            time.sleep(0.6)
+        return jobs
+
+    def _fetch_token(self, tenant: str, site_id: int) -> tuple[str, str]:
+        """Scrape the careers page to extract JWT token + cloud endpoint."""
+        url = f"https://{tenant}.csod.com/ux/ats/careersite/{site_id}/home?c={tenant}"
+        try:
+            r = requests.get(url, timeout=TIMEOUT,
+                             headers={"User-Agent": USER_AGENT})
+            if r.status_code != 200:
+                return "", ""
+            html = r.text
+        except requests.RequestException:
+            return "", ""
+
+        token = ""
+        endpoint = ""
+        # Token is in inline JS as a JWT (eyJ... three base64 chunks separated by .)
+        m = re.search(r'"(eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+)"', html)
+        if m:
+            token = m.group(1)
+        # Cloud endpoint looks like https://something.api.csod.com or similar
+        m = re.search(r'"(https://[a-z0-9.-]*api[a-z0-9.-]*\.csod\.com)"', html)
+        if m:
+            endpoint = m.group(1)
+        if not endpoint:
+            # Fallback: try a common default
+            endpoint = f"https://{tenant}.csod.com"
+        return token, endpoint
+
+
+FETCHERS = {
+    "greenhouse": GreenhouseFetcher(),
+    "lever": LeverFetcher(),
+    "ashby": AshbyFetcher(),
+    "workday": WorkdayFetcher(),
+    "rmk": SuccessFactorsRMKFetcher(),
+    "avature": AvatureFetcher(),
+    "eightfold": EightfoldFetcher(),
+    "phenom": PhenomFetcher(),
+    "cornerstone": CornerstoneFetcher(),
+}
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Notifiers
+# ──────────────────────────────────────────────────────────────────────────────
+
+def send_discord(jobs: list[Job], webhook_url: str) -> None:
+    """Discord allows up to 10 embeds per message."""
+    for i in range(0, len(jobs), 10):
+        batch = jobs[i:i + 10]
+        embeds = []
+        for j in batch:
+            embeds.append({
+                "title": j.title[:256] or "(untitled)",
+                "url": j.url,
+                "description": f"**{j.company}** — {j.location or 'location TBD'}"[:2000],
+                "footer": {"text": f"Posted: {j.posted}" if j.posted else "Posted recently"},
+                "color": 0x2eb886,
+            })
+        payload = {
+            "content": f"🔔 **{len(batch)} new role{'s' if len(batch) != 1 else ''}**",
+            "embeds": embeds,
+        }
+        try:
+            r = requests.post(webhook_url, json=payload, timeout=15)
+            if r.status_code >= 300:
+                print(f"  Discord error {r.status_code}: {r.text[:200]}")
+        except requests.RequestException as e:
+            print(f"  Discord send failed: {e}")
+        time.sleep(0.5)
+
+
+def send_ntfy(jobs: list[Job], topic: str) -> None:
+    """ntfy.sh: free push to phone. No account. Just install the app + pick a topic name."""
+    base = os.environ.get("NTFY_SERVER", "https://ntfy.sh").rstrip("/")
+    for j in jobs:
+        body = f"{j.company} • {j.location or 'location TBD'}\n{j.url}"
+        try:
+            requests.post(
+                f"{base}/{topic}",
+                data=body.encode("utf-8"),
+                headers={
+                    "Title": (j.title or "New job")[:100].encode("utf-8"),
+                    "Click": j.url,
+                    "Priority": "default",
+                    "Tags": "briefcase",
+                },
+                timeout=15,
+            )
+        except requests.RequestException as e:
+            print(f"  ntfy send failed: {e}")
+        time.sleep(0.2)
+
+
+def notify(jobs: list[Job]) -> None:
+    if not jobs:
+        return
+    discord = os.environ.get("DISCORD_WEBHOOK_URL", "").strip()
+    ntfy = os.environ.get("NTFY_TOPIC", "").strip()
+    if not discord and not ntfy:
+        print("⚠  No DISCORD_WEBHOOK_URL or NTFY_TOPIC set — printing instead.")
+        for j in jobs:
+            print(f"  • [{j.company}] {j.title} — {j.location} — {j.url}")
+        return
+    if discord:
+        send_discord(jobs, discord)
+    if ntfy:
+        send_ntfy(jobs, ntfy)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Persistence
+# ──────────────────────────────────────────────────────────────────────────────
+
+def load_seen() -> set[str]:
+    if SEEN_FILE.exists():
+        try:
+            return set(json.loads(SEEN_FILE.read_text()))
+        except (json.JSONDecodeError, OSError):
+            return set()
+    return set()
+
+
+def save_seen(seen: set[str]) -> None:
+    SEEN_FILE.write_text(json.dumps(sorted(seen), indent=0))
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Main
+# ──────────────────────────────────────────────────────────────────────────────
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="Monitor company ATSs for new chemE/process roles.")
+    parser.add_argument("--notify-all", action="store_true",
+                        help="Send notifications for everything matched, even on first run.")
+    parser.add_argument("--debug", action="store_true",
+                        help="Print every job title seen (matched or not).")
+    parser.add_argument("--only", default="", help="Only run for companies whose name contains this substring.")
+    parser.add_argument("--posted-within", default="",
+                        help=("Only keep jobs posted within this window. "
+                              "Examples: '24h', '1d', '7d', '2w', '30d'. "
+                              "Plain integers are treated as days. "
+                              "Also reads JOB_POSTED_WITHIN env var if flag is empty. "
+                              "Jobs with unparseable post dates are kept (better safe than missed)."))
+    args = parser.parse_args(argv)
+
+    # Resolve age filter (CLI flag wins over env var)
+    age_spec = args.posted_within or os.environ.get("JOB_POSTED_WITHIN", "").strip()
+    max_age = parse_age_filter(age_spec) if age_spec else None
+    if age_spec and max_age is None:
+        print(f"⚠  Couldn't parse --posted-within={age_spec!r}. "
+              f"Use formats like '24h', '7d', '2w'. Ignoring.")
+    if max_age:
+        print(f"Age filter: only keeping jobs posted in the last {age_spec} "
+              f"({max_age}).")
+
+    first_run = not SEEN_FILE.exists()
+    seen = load_seen()
+    if first_run:
+        print("First run — populating seen-jobs cache. Use --notify-all to push these.")
+
+    matched_jobs: list[Job] = []
+    fetched_total = 0
+    age_filtered = 0
+    errors: list[tuple[str, str]] = []
+    cutoff = datetime.now(timezone.utc) - max_age if max_age else None
+
+    for cfg in COMPANIES:
+        if args.only and args.only.lower() not in cfg["display_name"].lower():
+            continue
+        ats = cfg.get("ats")
+        fetcher = FETCHERS.get(ats)
+        if not fetcher:
+            continue
+        name = cfg["display_name"]
+        try:
+            jobs = fetcher.fetch(cfg)
+        except Exception as e:  # noqa: BLE001 — keep loop alive
+            errors.append((name, f"{type(e).__name__}: {e}"))
+            if args.debug:
+                traceback.print_exc()
+            continue
+        fetched_total += len(jobs)
+        new_for_company = 0
+        for j in jobs:
+            if args.debug:
+                marker = "✓" if title_matches(j.title) else " "
+                print(f"  {marker} [{name}] {j.title}")
+            if not title_matches(j.title):
+                continue
+
+            # Age filter
+            if cutoff is not None:
+                posted_dt = parse_posted_date(j.posted)
+                if posted_dt is not None and posted_dt < cutoff:
+                    age_filtered += 1
+                    if args.debug:
+                        print(f"      (skipped: posted {j.posted}, older than cutoff)")
+                    continue
+                # If unparseable, keep — better to over-notify than miss.
+
+            if j.key() in seen:
+                continue
+            seen.add(j.key())
+            matched_jobs.append(j)
+            new_for_company += 1
+        if new_for_company:
+            print(f"  + {name}: {new_for_company} new match(es)")
+
+    print(f"\nFetched {fetched_total} postings across {len(COMPANIES)} companies.")
+    print(f"Matched {len(matched_jobs)} new role(s).")
+    if age_filtered:
+        print(f"Filtered out {age_filtered} role(s) older than {age_spec}.")
+    if errors:
+        print(f"\n{len(errors)} error(s):")
+        for name, err in errors:
+            print(f"  ✗ {name}: {err}")
+
+    save_seen(seen)
+
+    should_notify = bool(matched_jobs) and (args.notify_all or not first_run)
+    if should_notify:
+        print(f"\nSending {len(matched_jobs)} notification(s)…")
+        notify(matched_jobs)
+    elif first_run and matched_jobs:
+        print(f"\n(Skipping notifications on first run — would have sent {len(matched_jobs)}.)")
+        print("Re-run with --notify-all to push these.")
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
