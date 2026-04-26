@@ -30,7 +30,7 @@ jobs:
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
           JOB_POSTED_WITHIN: ${{ secrets.JOB_POSTED_WITHIN }}
         run: |
-          python monitor.py 2>&1 | tee run.log
+          python monitor.py --notify-all 2>&1 | tee run.log
           # Capture company error count to surface in the summary
           if grep -qE "^\s*[0-9]+ error\(s\):" run.log; then
             errors=$(grep -E "^\s*[0-9]+ error\(s\):" run.log | head -1)
