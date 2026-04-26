@@ -273,4 +273,4 @@ or add to `EXCLUDE_PATTERNS`.
 
 **First run pushed nothing:** that's by design — it caches everything as
 "already seen" so you don't get blasted with hundreds of postings. Use
-`python monitor.py --notify-all` once if you actually want the backlog.
+`python monitor.py --notify-all` once if you actually want the backlog..
