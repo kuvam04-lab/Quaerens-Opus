@@ -27,7 +27,10 @@ from companies import COMPANIES, DEFAULT_SEARCH_TERMS
 
 SEEN_FILE = Path(__file__).parent / "seen_jobs.json"
 TIMEOUT = 25
-USER_AGENT = "JobMonitor/1.0 (personal use)"
+USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36"
+)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -253,25 +256,68 @@ def is_us_location(location: str) -> bool:
 
 # Title must contain one of these (case-insensitive, regex-friendly).
 INCLUDE_PATTERNS = [
+    # Core titles
     r"\bprocess\s+engineer",
     r"\bprocess\s+development\s+engineer",
     r"\bchemical\s+engineer",
     r"\brefining\s+engineer",
     r"\bmidstream\s+engineer",
-    r"\bprocess\s+development\b",   # catches "Process Development Scientist I" etc.
-    r"\bmanufacturing\s+engineer",  # often used for chemE-style roles in pharma/semis
+    r"\bprocess\s+development\b",         # "Process Development Scientist"
+    r"\bmanufacturing\s+engineer",        # pharma/semi alt-naming
+    # ChemE-adjacent engineering titles common at target companies
+    r"\bproduction\s+engineer",
+    r"\bplant\s+engineer",
+    r"\boperations\s+engineer",
+    # Reversed order: "Engineer - Operations", "Engineer, Process", etc.
+    # Some companies (esp. oil/gas) lead with "Engineer" and put the discipline after.
+    r"\bengineer\s*[-,\u2013\u2014]\s*(?:process|operations|production|plant|reliability|chemical|refining|midstream|manufacturing)",
+    r"\breliability\s+engineer",
+    r"\bprocess\s+(?:control|safety|design|systems|technology|automation)\s+engineer",
+    r"\b(?:r&d|research\s+and\s+development|research\s+&\s+development)\s+engineer",
+    r"\bresearch\s+engineer",             # often R&D at chemical companies
+    r"\bproduct\s+(?:development|engineer)\b",  # specialty chems
+    r"\bprocess\s+technologist\b",
+    # Rotational / Early-career programs (broad match, then filtered by exclude)
+    r"\brotational\b",                    # any title with 'rotational'
+    r"\b(?:early\s+career|new\s+grad(?:uate)?|graduate|entry[\s-]?level)\b",
+    r"\b(?:engineering|engineer)\s+(?:development|leadership|trainee)\s+program",
+    r"\bdevelopment\s+program\b",         # "Engineering Development Program"
+    r"\bltop\b",                          # Linde Technical Operations Program
+    r"\b(?:technical|engineering)\s+(?:operations|career\s+path)\s+program",
+    r"\bassociate\s+engineer",
+    r"\bjunior\s+engineer",
+    r"\b(?:engineer|engineering)\s+trainee\b",
+    r"\btrainee\s+engineer\b",
+    # Industry-specific titles (chemical / pharma / bioprocess specialties)
+    r"\bcatalyst\s+engineer\b",
+    r"\bpolymer\s+engineer\b",
+    r"\bformulation(?:s)?\s+engineer\b",
+    r"\bfermentation\s+engineer\b",
+    r"\bdownstream\s+(?:processing\s+)?engineer\b",   # bioprocess
+    # Functional / mission-area titles
+    r"\bprocess\s+intensification\b",
+    r"\bsustainability\s+engineer\b",
+    r"\bdecarbonization\s+engineer\b",
 ]
 
 # Exclude these (senior signals + advanced levels).
 EXCLUDE_PATTERNS = [
     r"\bsenior\b", r"\bsr\.?\b", r"\bprincipal\b", r"\bstaff\b",
-    r"\bmanager\b", r"\bdirector\b", r"\blead\b", r"\bexpert\b",
+    r"\bmanager\b", r"\bdirector\b", r"\bvp\b", r"\bvice\s+president\b",
+    r"\bhead\s+of\b", r"\bchief\b",
+    r"\blead\b",                          # exclude any "lead X engineer" or "X lead"
+    r"\bexpert\b",
     r"\b(ii|iii|iv|v)\b",                # Roman 2–5
     r"\b(level\s*[2-9])\b",
     r"\bengineer\s*[2-9]\b",             # "Engineer 2", "Engineer 3" ...
-    r"\bphd\b",
+    r"\bphd\b", r"\bdoctoral\b", r"\bpostdoc",
     r"\bintern\b", r"\binternship\b", r"\bco-?op\b",
-    r"\bsales\b",
+    r"\bsales\b", r"\bmarketing\b",
+    r"\b(?:executive|exec)\b",
+    # Don't match support/sales/admin roles even if they contain rotational keywords
+    r"\bcustomer\s+(?:service|support)\b",
+    r"\b(?:hr|human\s+resources)\b",
+    r"\bfinance\b", r"\baccounting\b", r"\blegal\b",
 ]
 
 INCLUDE_RE = re.compile("|".join(INCLUDE_PATTERNS), re.IGNORECASE)
@@ -375,6 +421,8 @@ class SuccessFactorsRMKFetcher:
       ats            : "rmk"
       base_url       : "https://jobs.exxonmobil.com"  (no trailing slash)
       category_paths : ["/go/Engineering/3845600/", ...]   (one or more)
+                       OR search paths like ["/search/?q=engineer"] —
+                       the fetcher auto-detects which kind it is.
       country_filter : ["US"]   (optional; default keeps US + unknown locations)
     """
 
@@ -395,15 +443,22 @@ class SuccessFactorsRMKFetcher:
         seen_urls: set[str] = set()
 
         for cat_path in category_paths:
-            if not cat_path.endswith("/"):
+            is_search = "/search" in cat_path.lower()
+            if not is_search and not cat_path.endswith("/"):
                 cat_path += "/"
             empty_streak = 0
             for page in range(self.MAX_PAGES):
                 offset = page * self.PAGE_SIZE
-                if offset == 0:
-                    url = f"{base}{cat_path}?sortColumn=referencedate&sortDirection=desc"
+                if is_search:
+                    # /search/?...&startrow=N pagination
+                    sep = "&" if "?" in cat_path else "?"
+                    url = f"{base}{cat_path}{sep}startrow={offset}"
                 else:
-                    url = f"{base}{cat_path}{offset}/?sortColumn=referencedate&sortDirection=desc"
+                    # /go/{Category}/{ID}/{offset}/ pagination
+                    if offset == 0:
+                        url = f"{base}{cat_path}?sortColumn=referencedate&sortDirection=desc"
+                    else:
+                        url = f"{base}{cat_path}{offset}/?sortColumn=referencedate&sortDirection=desc"
                 try:
                     r = requests.get(url, timeout=TIMEOUT,
                                      headers={"User-Agent": USER_AGENT})
@@ -485,42 +540,110 @@ class WorkdayFetcher:
       - api_url:  e.g. "https://msd.wd5.myworkdayjobs.com/wday/cxs/msd/SearchJobs/jobs"
       - base_url: e.g. "https://msd.wd5.myworkdayjobs.com/en-US/SearchJobs"
                   (used to build clickable job links)
+
+    Strategy: pull ALL jobs (empty searchText) and let title_matches do the
+    filtering. This is more robust than per-term keyword searches because:
+      (a) some Workday tenants reject keyword searches with HTTP 422
+      (b) keyword matching in Workday's index doesn't always match obvious
+          titles (e.g. "Process Engineer I" might not match the search
+          term "process engineer" depending on how the tenant has indexed)
+    Capped at 1000 jobs per company to keep run time reasonable.
     """
+
+    PAGE_SIZE = 20
+    MAX_PAGES = 50   # 50 * 20 = 1000 jobs cap per company
 
     def fetch(self, cfg: dict) -> list[Job]:
         api_url = cfg["api_url"]
         base_url = cfg["base_url"].rstrip("/")
-        search_terms = cfg.get("search_terms", DEFAULT_SEARCH_TERMS)
         seen_paths: set[str] = set()
         jobs: list[Job] = []
 
-        for term in search_terms:
+        offset = 0
+        for page in range(self.MAX_PAGES):
+            body = {
+                "limit": self.PAGE_SIZE,
+                "offset": offset,
+                "searchText": "",
+                "appliedFacets": {},
+            }
+            try:
+                r = requests.post(
+                    api_url,
+                    json=body,
+                    timeout=TIMEOUT,
+                    headers={
+                        "Accept": "application/json",
+                        "Content-Type": "application/json",
+                        "User-Agent": USER_AGENT,
+                    },
+                )
+            except requests.RequestException as e:
+                print(f"  Workday request failed for {cfg['display_name']}: {e}")
+                break
+            if r.status_code != 200:
+                # Some tenants reject empty searchText with 400/422 — try a
+                # fallback with a single broad keyword that nearly all
+                # Workday tenants accept.
+                if page == 0 and r.status_code in (400, 422):
+                    return self._fetch_with_keyword(cfg)
+                print(f"  Workday {cfg['display_name']} returned {r.status_code}")
+                break
+            try:
+                data = r.json()
+            except ValueError:
+                break
+            postings = data.get("jobPostings", [])
+            if not postings:
+                break
+            for p in postings:
+                ext = p.get("externalPath", "")
+                if not ext or ext in seen_paths:
+                    continue
+                seen_paths.add(ext)
+                job_url = base_url + ext if ext.startswith("/") else f"{base_url}/{ext}"
+                jobs.append(Job(
+                    company=cfg["display_name"],
+                    title=p.get("title", ""),
+                    location=p.get("locationsText", ""),
+                    url=job_url,
+                    posted=p.get("postedOn", ""),
+                    job_id=ext.split("/")[-1] or ext,
+                ))
+            if len(postings) < self.PAGE_SIZE:
+                break
+            offset += self.PAGE_SIZE
+            time.sleep(0.3)
+        return jobs
+
+    def _fetch_with_keyword(self, cfg: dict) -> list[Job]:
+        """Fallback for Workday tenants that reject empty searchText.
+        Tries a single broad keyword 'engineer'."""
+        api_url = cfg["api_url"]
+        base_url = cfg["base_url"].rstrip("/")
+        seen_paths: set[str] = set()
+        jobs: list[Job] = []
+
+        for term in ["engineer", "engineering"]:
             offset = 0
-            limit = 20
-            pages = 0
-            while pages < 6:  # safety cap: 120 results per term
+            for page in range(20):  # 400 jobs cap per term
                 body = {
-                    "limit": limit,
+                    "limit": self.PAGE_SIZE,
                     "offset": offset,
                     "searchText": term,
                     "appliedFacets": {},
                 }
                 try:
-                    r = requests.post(
-                        api_url,
-                        json=body,
-                        timeout=TIMEOUT,
-                        headers={
-                            "Accept": "application/json",
-                            "Content-Type": "application/json",
-                            "User-Agent": USER_AGENT,
-                        },
-                    )
-                except requests.RequestException as e:
-                    print(f"  Workday request failed for {cfg['display_name']} ({term!r}): {e}")
+                    r = requests.post(api_url, json=body, timeout=TIMEOUT,
+                                      headers={"Accept": "application/json",
+                                               "Content-Type": "application/json",
+                                               "User-Agent": USER_AGENT})
+                except requests.RequestException:
                     break
                 if r.status_code != 200:
-                    print(f"  Workday {cfg['display_name']} returned {r.status_code} for {term!r}")
+                    if page == 0:
+                        print(f"  Workday {cfg['display_name']} returned "
+                              f"{r.status_code} on fallback for {term!r}")
                     break
                 try:
                     data = r.json()
@@ -543,13 +666,13 @@ class WorkdayFetcher:
                         posted=p.get("postedOn", ""),
                         job_id=ext.split("/")[-1] or ext,
                     ))
-                if len(postings) < limit:
+                if len(postings) < self.PAGE_SIZE:
                     break
-                offset += limit
-                pages += 1
-                time.sleep(0.4)
-            time.sleep(0.4)
+                offset += self.PAGE_SIZE
+                time.sleep(0.3)
+            time.sleep(0.3)
         return jobs
+
 
 
 class AvatureFetcher:
@@ -701,20 +824,46 @@ class EightfoldFetcher:
         jobs: list[Job] = []
         seen_ids: set[str] = set()
 
+        # Try both URL patterns. Some tenants put the API at /api/apply/v2/jobs,
+        # others at /careers/api/apply/v2/jobs. We probe both on first request.
+        api_paths_to_try = [
+            "/api/apply/v2/jobs",
+            "/careers/api/apply/v2/jobs",
+            "/api/v1/jobs",
+        ]
+        working_path = None
+
         for page in range(self.MAX_PAGES):
             start = page * self.PAGE_SIZE
-            url = (f"{base}/api/apply/v2/jobs?"
-                   f"domain={domain}&hl=en&start={start}&num={self.PAGE_SIZE}")
-            try:
-                r = requests.get(url, timeout=TIMEOUT,
-                                 headers={"Accept": "application/json",
-                                          "User-Agent": USER_AGENT})
-                if r.status_code != 200:
-                    print(f"  Eightfold {cfg['display_name']} returned {r.status_code}")
-                    break
-                data = r.json()
-            except (requests.RequestException, ValueError) as e:
-                print(f"  Eightfold fetch failed for {cfg['display_name']}: {e}")
+            data = None
+
+            if working_path:
+                paths = [working_path]
+            else:
+                paths = api_paths_to_try
+
+            for path in paths:
+                url = (f"{base}{path}?"
+                       f"domain={domain}&hl=en&start={start}&num={self.PAGE_SIZE}")
+                try:
+                    r = requests.get(url, timeout=TIMEOUT,
+                                     headers={"Accept": "application/json",
+                                              "User-Agent": USER_AGENT})
+                    if r.status_code == 200:
+                        try:
+                            data = r.json()
+                            working_path = path
+                            break
+                        except ValueError:
+                            continue
+                except requests.RequestException as e:
+                    print(f"  Eightfold fetch failed for {cfg['display_name']}: {e}")
+                    return jobs
+
+            if data is None:
+                if not working_path:
+                    print(f"  Eightfold {cfg['display_name']}: both URL patterns "
+                          f"failed (tried {api_paths_to_try})")
                 break
 
             positions = data.get("positions") or data.get("data", {}).get("positions", [])
@@ -734,8 +883,19 @@ class EightfoldFetcher:
                     parts = [loc.get("city"), loc.get("state"), loc.get("country")]
                     loc = ", ".join([x for x in parts if x])
                 country = (p.get("country") or "").upper()
+                # locations[] can contain dicts OR plain strings like
+                # "Charlotte, NC, United States". Handle both.
                 if not country and isinstance(p.get("locations"), list) and p["locations"]:
-                    country = (p["locations"][0].get("country") or "").upper()
+                    first = p["locations"][0]
+                    if isinstance(first, dict):
+                        country = (first.get("country") or "").upper()
+                    elif isinstance(first, str):
+                        if not loc:
+                            loc = first
+                        # try to extract country from end of string
+                        parts = [t.strip() for t in first.split(",")]
+                        if parts:
+                            country = parts[-1].upper()
 
                 # Country filter — match either explicit `country` field or
                 # presence of the country code in the location string.
@@ -804,10 +964,24 @@ class PhenomFetcher:
 
     def fetch(self, cfg: dict) -> list[Job]:
         base = cfg["base_url"].rstrip("/")
-        ref_num = cfg["ref_num"]
+        ref_num = cfg.get("ref_num", "")
+
+        # Auto-discover refNum if it's missing or looks like a placeholder
+        # (placeholders are uppercase company names: ABBVIE, ROCHE, etc.).
+        # A real Phenom refNum is 6-10 chars of mixed case+digits, e.g. MQAEGZUS.
+        if not ref_num or self._looks_like_placeholder(ref_num):
+            discovered = self._discover_ref_num(base)
+            if discovered:
+                if ref_num:
+                    print(f"  Phenom {cfg['display_name']}: auto-discovered refNum "
+                          f"{discovered!r} (replaces placeholder {ref_num!r})")
+                ref_num = discovered
+            elif not ref_num:
+                print(f"  Phenom {cfg['display_name']}: no refNum configured "
+                      f"and auto-discovery failed")
+                return []
+
         country_filter = cfg.get("country_filter") or ["US"]
-        # Phenom usually wants the full country name in the search filter:
-        # "United States". Translate "US" → "United States" by default.
         country_ok = []
         for c in country_filter:
             if c.upper() == "US":
@@ -907,6 +1081,56 @@ class PhenomFetcher:
                 break
             time.sleep(0.4)
         return jobs
+
+    @staticmethod
+    def _looks_like_placeholder(ref_num: str) -> bool:
+        """Heuristic: real Phenom refNums are mixed case/digits (e.g. MQAEGZUS,
+        EBKEGNUF, GAOGAYGLOBAL). Placeholders are all-uppercase common-English
+        words (ABBVIE, ROCHE, REGENERON). Treat short all-letter all-uppercase
+        strings as placeholders that need rediscovery."""
+        if not ref_num or len(ref_num) > 20:
+            return False
+        # Real refNums almost always have at least one of: digit, lowercase
+        # letter, or are 8+ chars of consonant-heavy mixed letters.
+        if any(c.isdigit() or c.islower() for c in ref_num):
+            return False
+        # All uppercase, no digits — looks like a placeholder English word.
+        # Whitelist a few known-real all-caps refNums that don't follow the
+        # typical pattern, in case Phenom uses them.
+        return True
+
+    def _discover_ref_num(self, base_url: str) -> str:
+        """Scrape the careers site's search-results page to extract the refNum
+        from inline JS. Tries common URL patterns."""
+        candidate_paths = [
+            "/global/en/search-results",
+            "/en/search-results",
+            "/search-results",
+            "/jobs",
+            "/en/jobs",
+            "/",
+        ]
+        for path in candidate_paths:
+            url = base_url.rstrip("/") + path
+            try:
+                r = requests.get(url, timeout=TIMEOUT,
+                                 headers={"User-Agent": USER_AGENT,
+                                          "Accept": "text/html"})
+            except requests.RequestException:
+                continue
+            if r.status_code != 200:
+                continue
+            # Multiple patterns the refNum might appear in
+            patterns = [
+                r'"refNum"\s*:\s*"([A-Za-z0-9]+)"',
+                r"refNum\s*=\s*['\"]([A-Za-z0-9]+)['\"]",
+                r"cdn\.phenompeople\.com/CareerConnectResources/([A-Z0-9]+)/",
+            ]
+            for pat in patterns:
+                m = re.search(pat, r.text)
+                if m:
+                    return m.group(1)
+        return ""
 
 
 class CornerstoneFetcher:
@@ -1072,6 +1296,273 @@ class CornerstoneFetcher:
         return token, endpoint
 
 
+class TaleoFetcher:
+    """
+    Oracle Taleo career sites. URL structure:
+      https://{zone}.taleo.net/careersection/{cs_code}/jobsearch.ftl?lang=en
+
+    Strategy: use Taleo's built-in RSS feed when available
+      https://{zone}.taleo.net/careersection/{cs_code}/rss.ftl?lang=en
+    Falls back to HTML scraping of the search page if RSS isn't enabled.
+
+    Config:
+      ats             : "taleo"
+      display_name    : str
+      zone            : str       — subdomain, e.g. "valero" for valero.taleo.net
+      cs_code         : str       — career section code, e.g. "2", "career", "ext"
+      country_filter  : list[str] (optional)
+    """
+
+    MAX_PAGES = 10
+    PAGE_SIZE = 25
+
+    def fetch(self, cfg: dict) -> list[Job]:
+        try:
+            from bs4 import BeautifulSoup
+        except ImportError:
+            print("  Taleo fetcher needs beautifulsoup4: pip install beautifulsoup4")
+            return []
+
+        zone = cfg["zone"]
+        cs_code = cfg["cs_code"]
+        base = f"https://{zone}.taleo.net"
+
+        # Try RSS feed first
+        rss_url = f"{base}/careersection/{cs_code}/rss.ftl?lang=en"
+        try:
+            r = requests.get(rss_url, timeout=TIMEOUT,
+                             headers={"User-Agent": USER_AGENT,
+                                      "Accept": "application/rss+xml,application/xml"})
+            if r.status_code == 200 and ("<rss" in r.text or "<feed" in r.text):
+                return self._parse_rss(r.text, cfg, base)
+        except requests.RequestException as e:
+            print(f"  Taleo RSS fetch failed for {cfg['display_name']}: {e}")
+
+        # Fallback: HTML scrape of the search page
+        return self._scrape_html(cfg, base, cs_code, BeautifulSoup)
+
+    def _parse_rss(self, xml_text: str, cfg: dict, base: str) -> list[Job]:
+        """Parse Taleo's RSS feed. Each <item> has title, link, pubDate, description."""
+        try:
+            from bs4 import BeautifulSoup
+        except ImportError:
+            return []
+        soup = BeautifulSoup(xml_text, "xml")
+        jobs: list[Job] = []
+        for item in soup.find_all("item"):
+            title = (item.title.get_text(strip=True) if item.title else "")
+            link = (item.link.get_text(strip=True) if item.link else "")
+            pub_date = (item.pubDate.get_text(strip=True) if item.pubDate else "")
+            description = (item.description.get_text(strip=True) if item.description else "")
+            # Try to extract location from description (Taleo descriptions
+            # often contain location text after a "-" or in parentheses).
+            location = ""
+            m = re.search(r"(?:Location|Lieu|Ubicación)[:\s]+([^|\n<]+)", description, re.I)
+            if m:
+                location = m.group(1).strip()
+            else:
+                # Heuristic: many feeds put "City, ST" at the end of the title or description
+                m2 = re.search(r"([A-Za-z .]+,\s*[A-Z]{2}(?:,\s*US)?)", title + " " + description)
+                if m2:
+                    location = m2.group(1).strip()
+
+            # Job ID: extract from URL (?job=12345 or /jobid/12345)
+            job_id = ""
+            m3 = re.search(r"job[=/](\d+)", link, re.I)
+            if m3:
+                job_id = m3.group(1)
+            else:
+                job_id = link[-50:]   # last chunk as fallback
+
+            jobs.append(Job(
+                company=cfg["display_name"],
+                title=title,
+                location=location,
+                url=link,
+                posted=pub_date,
+                job_id=job_id,
+            ))
+        return jobs
+
+    def _scrape_html(self, cfg, base, cs_code, BeautifulSoup) -> list[Job]:
+        """Fallback when RSS isn't available — scrape the search results page.
+
+        Most Taleo sites render results in a server-side table/list. We look
+        for any <a href> matching the jobdetail.ftl pattern.
+        """
+        jobs: list[Job] = []
+        seen_ids: set[str] = set()
+        for page in range(self.MAX_PAGES):
+            offset = page * self.PAGE_SIZE + 1
+            url = (f"{base}/careersection/{cs_code}/jobsearch.ftl?"
+                   f"lang=en&radiusType=K&searchExpanded=true"
+                   f"&pageNo={page + 1}&searchByLocation=false")
+            try:
+                r = requests.get(url, timeout=TIMEOUT,
+                                 headers={"User-Agent": USER_AGENT})
+                if r.status_code != 200:
+                    break
+            except requests.RequestException:
+                break
+            soup = BeautifulSoup(r.text, "html.parser")
+            page_count = 0
+            for link in soup.find_all("a", href=lambda h: h and "jobdetail.ftl" in h):
+                href = link.get("href", "")
+                title = link.get_text(strip=True)
+                if not href or not title:
+                    continue
+                full_url = href if href.startswith("http") else (base + href if href.startswith("/") else f"{base}/{href}")
+                m = re.search(r"job=(\d+)", full_url)
+                job_id = m.group(1) if m else full_url[-30:]
+                if job_id in seen_ids:
+                    continue
+                seen_ids.add(job_id)
+
+                # Try to find location in nearby cells
+                location = ""
+                row = link.find_parent(["tr", "li", "div"])
+                if row:
+                    # Look for a sibling cell or span containing location-like text
+                    for cell in row.find_all(["td", "span", "div"]):
+                        txt = cell.get_text(strip=True)
+                        if re.search(r"[A-Za-z .]+,\s*[A-Z]{2}", txt) and txt != title:
+                            location = txt
+                            break
+
+                jobs.append(Job(
+                    company=cfg["display_name"],
+                    title=title,
+                    location=location,
+                    url=full_url,
+                    posted="",
+                    job_id=job_id,
+                ))
+                page_count += 1
+            if page_count == 0:
+                break
+            time.sleep(0.5)
+        return jobs
+
+
+class GenericHtmlFetcher:
+    """
+    Last-resort fetcher for fully custom careers sites that don't use any
+    standard ATS. Scrapes an HTML page and extracts any <a> links whose text
+    looks like a job title and URL looks like a job detail page.
+
+    This is a "best effort" approach — it works well for sites like
+    careers.lockheedmartinjobs.com, careers.bms.com, careers.regeneron.com
+    that render their job lists server-side. It will NOT work for sites that
+    render the listing entirely in JavaScript.
+
+    Config:
+      ats              : "generic_html"
+      display_name     : str
+      url              : str       — search results page URL
+      link_must_contain: str | list[str] — substring(s) job links must contain
+                                     in their href to be considered a job link
+                                     (e.g. "/job/", "/jobs/", "?pid=")
+      max_pages        : int (optional) — for sites with ?page=N pagination
+      page_param       : str (optional) — query param name for pagination
+      country_filter   : list[str] (optional)
+
+    NOTE: this fetcher cannot extract dates or locations reliably for every
+    site, so the post-fetch filters may be less effective. Use sparingly.
+    """
+
+    DEFAULT_MAX_PAGES = 5
+
+    def fetch(self, cfg: dict) -> list[Job]:
+        try:
+            from bs4 import BeautifulSoup
+        except ImportError:
+            print("  Generic HTML fetcher needs beautifulsoup4")
+            return []
+
+        url_template = cfg["url"]
+        markers = cfg.get("link_must_contain")
+        if isinstance(markers, str):
+            markers = [markers]
+        if not markers:
+            print(f"  {cfg['display_name']}: generic_html requires 'link_must_contain'")
+            return []
+
+        max_pages = cfg.get("max_pages", self.DEFAULT_MAX_PAGES)
+        page_param = cfg.get("page_param")
+        jobs: list[Job] = []
+        seen_urls: set[str] = set()
+
+        for page in range(max_pages):
+            if page_param and page > 0:
+                sep = "&" if "?" in url_template else "?"
+                url = f"{url_template}{sep}{page_param}={page + 1}"
+            elif page > 0:
+                break  # no pagination configured
+            else:
+                url = url_template
+            try:
+                r = requests.get(url, timeout=TIMEOUT,
+                                 headers={"User-Agent": USER_AGENT})
+                if r.status_code != 200:
+                    print(f"  {cfg['display_name']} returned {r.status_code}")
+                    break
+            except requests.RequestException as e:
+                print(f"  {cfg['display_name']} fetch failed: {e}")
+                break
+
+            soup = BeautifulSoup(r.text, "html.parser")
+            page_count = 0
+            # Get the base URL from the request URL for resolving relative hrefs
+            from urllib.parse import urlparse, urljoin
+            parsed = urlparse(url)
+            url_base = f"{parsed.scheme}://{parsed.netloc}"
+
+            for link in soup.find_all("a", href=True):
+                href = link["href"]
+                if not any(m in href for m in markers):
+                    continue
+                title = link.get_text(strip=True)
+                if not title or len(title) < 5 or len(title) > 200:
+                    continue
+                # Skip "Apply Now" / "View Job" / nav-style links
+                if title.lower() in {"apply", "apply now", "view job", "see more",
+                                     "learn more", "details", "read more"}:
+                    continue
+                full_url = href if href.startswith("http") else urljoin(url_base, href)
+                full_url = full_url.split("#")[0]
+                if full_url in seen_urls:
+                    continue
+                seen_urls.add(full_url)
+
+                # Best-effort location extraction from neighboring elements
+                location = ""
+                container = link.find_parent(["li", "article", "tr", "div"])
+                if container:
+                    text = container.get_text(" ", strip=True)
+                    m = re.search(r"([A-Za-z .]+,\s*[A-Z]{2}(?:,\s*US)?)", text)
+                    if m:
+                        location = m.group(1).strip()
+
+                # Job ID: best-effort from the URL
+                job_id_m = re.search(r"(\d{4,})", full_url)
+                job_id = job_id_m.group(1) if job_id_m else full_url[-40:]
+
+                jobs.append(Job(
+                    company=cfg["display_name"],
+                    title=title,
+                    location=location,
+                    url=full_url,
+                    posted="",
+                    job_id=job_id,
+                ))
+                page_count += 1
+
+            if page_count == 0:
+                break
+            time.sleep(0.5)
+        return jobs
+
+
 class BrassRingFetcher:
     """
     Kenexa BrassRing (TalentLink) — IBM/Infor's legacy ATS.
@@ -1206,6 +1697,8 @@ FETCHERS = {
     "phenom": PhenomFetcher(),
     "cornerstone": CornerstoneFetcher(),
     "brassring": BrassRingFetcher(),
+    "taleo": TaleoFetcher(),
+    "generic_html": GenericHtmlFetcher(),
 }
 
 
@@ -1336,8 +1829,24 @@ def run_validate(args) -> int:
                   f"check URL/ref_num/site_id")
             zero_jobs.append((name, ats))
         else:
-            print(f"{name:32s}  {ats:12s}  ✓  {n:4d} jobs")
+            kept = sum(1 for j in jobs if title_matches(j.title))
+            print(f"{name:32s}  {ats:12s}  ✓  {n:4d} jobs ({kept} match title filter)")
             ok_count += 1
+
+        # --debug: print every title with a ✓ (would notify) or · (filtered out)
+        # marker. Useful for tuning INCLUDE_PATTERNS / EXCLUDE_PATTERNS.
+        if args.debug and jobs:
+            for j in jobs:
+                if title_matches(j.title):
+                    marker = "✓"
+                else:
+                    # Show WHY it was filtered: include miss vs exclude hit
+                    if EXCLUDE_RE.search(j.title):
+                        marker = "✗ excl"
+                    else:
+                        marker = "·"
+                loc = j.location[:30] if j.location else ""
+                print(f"      {marker:7s} {j.title[:70]:70s}  {loc}")
 
     print("-" * 100)
     print(f"\nSummary: {ok_count} OK, {len(zero_jobs)} returned zero, {len(failed)} errored.\n")

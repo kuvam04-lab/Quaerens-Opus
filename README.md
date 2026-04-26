@@ -228,9 +228,16 @@ Lockheed, etc.): use the recipe above and add a new line to `companies.py`.
 
 ## Companies covered
 
-All 55 companies on your target list are wired up across 10 ATS fetchers:
-Workday (43), SuccessFactors RMK (4), Greenhouse (2), Phenom People (2),
-Avature (1), Cornerstone (1), Eightfold AI (1), BrassRing (1).
+All 56 companies on your target list are wired up across 12 ATS fetchers:
+Workday (23), generic_html (10), SuccessFactors RMK (8), Phenom (7),
+Eightfold AI (3), Taleo (2), and 1 each of Avature, BrassRing, Greenhouse.
+
+**`generic_html`** is a fallback fetcher for fully custom careers sites
+(Lockheed, RTX, L3Harris, J&J, Takeda, Dow, etc.) that don't use a
+standard ATS. It scrapes server-rendered HTML and extracts links matching
+configurable patterns. Less reliable than ATS-specific fetchers — date and
+location extraction are best-effort — but covers companies that would
+otherwise need a Selenium/Playwright scraper.
 
 ---
 
