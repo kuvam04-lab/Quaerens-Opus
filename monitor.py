@@ -272,7 +272,15 @@ INCLUDE_PATTERNS = [
     # Some companies (esp. oil/gas) lead with "Engineer" and put the discipline after.
     r"\bengineer\s*[-,\u2013\u2014]\s*(?:process|operations|production|plant|reliability|chemical|refining|midstream|manufacturing)",
     r"\breliability\s+engineer",
-    r"\bprocess\s+(?:control|safety|design|systems|technology|automation)\s+engineer",
+    r"\bprocess\s+(?:control|controls|safety|design|systems|technology|automation)\s+engineer",
+    # Controls / automation / instrumentation roles (common ChemE crossover)
+    r"\bcontrols?\s+engineer\b",                        # "Controls Engineer" or "Control Engineer"
+    r"\bcontrol\s+systems?\s+engineer\b",
+    r"\bautomation\s+engineer\b",
+    r"\binstrumentation(?:\s+and\s+controls?)?\s+engineer\b",   # "I&C Engineer" written out
+    r"\bi\s*&\s*c\s+engineer\b",                        # "I&C Engineer" with the ampersand
+    r"\bdcs\s+engineer\b",                              # Distributed Control Systems
+    r"\bplc\s+engineer\b",                              # Programmable Logic Controller
     r"\b(?:r&d|research\s+and\s+development|research\s+&\s+development)\s+engineer",
     r"\bresearch\s+engineer",             # often R&D at chemical companies
     r"\bproduct\s+(?:development|engineer)\b",  # specialty chems
