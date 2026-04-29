@@ -80,6 +80,7 @@ COMPANIES = [
      "category_paths": ["/go/Engineering/9606200/",
                         "/go/Refinery-Operations-&-LaboratoryTerminals-&-Pipelines/9606400/"],
      "country_filter": ["US"]},
+   {"display_name": "Oneok",         "ats": "workday", **_wd("oneok",     "wd1", "ONEOK")},
 
     # ─── Chemicals & Specialty Materials ─────────────────────────────────────
     {"display_name": "Dow",                "ats": "workday", **_wd("dow",           "wd1", "ExternalCareers")},
