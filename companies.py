@@ -176,6 +176,7 @@ COMPANIES = [
      "url": "https://jobs.takeda.com/search-jobs/United%20States/1113/2/6252001/39x76/-98x5/50/2",
      "link_must_contain": ["/job/"],
      "country_filter": ["US"]},
+   {"display_name": "Novonesis",              "ats": "workday", **_wd("novozymes",         "wd103", "Novonesis_Careers")},
 
     # ─── Defense & Aerospace ─────────────────────────────────────────────────
     # Lockheed lockheedmartinjobs.com — custom
