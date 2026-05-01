@@ -136,6 +136,7 @@ COMPANIES = [
      "url": "https://career4.successfactors.com/careers?company=azcprd",
      "link_must_contain": ["/job?", "/jobs/"],
      "country_filter": ["US"]},
+  {"display_name": "Chemours",          "ats": "workday", **_wd("chemours",         "wd103", "Chemours")},
 
     # ─── Pharma & Biopharma ──────────────────────────────────────────────────
     {"display_name": "Merck (MSD)",        "ats": "workday", **_wd("msd",           "wd5", "SearchJobs")},
