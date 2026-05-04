@@ -216,6 +216,7 @@ COMPANIES = [
      "base_url": "https://appliedmaterials.eightfold.ai",
      "domain": "appliedmaterials.com",
      "country_filter": ["US"]},
+   {"display_name": "Applied Materials",              "ats": "workday", **_wd("amat",         "wd1", "External")},
     {"display_name": "Lam Research",       "ats": "eightfold",
      "base_url": "https://lamresearch.eightfold.ai",
      "domain": "lamresearch.com",
