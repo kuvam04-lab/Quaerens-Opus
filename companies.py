@@ -178,6 +178,7 @@ COMPANIES = [
      "link_must_contain": ["/job/"],
      "country_filter": ["US"]},
    {"display_name": "Novonesis",              "ats": "workday", **_wd("novozymes",         "wd103", "Novonesis_Careers")},
+  {"display_name": "Siegfried",              "ats": "workday", **_wd("siegfried",         "wd103", "external")},
 
     # ─── Defense & Aerospace ─────────────────────────────────────────────────
     # Lockheed lockheedmartinjobs.com — custom
