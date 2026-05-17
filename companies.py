@@ -137,6 +137,12 @@ COMPANIES = [
      "link_must_contain": ["/job?", "/jobs/"],
      "country_filter": ["US"]},
   {"display_name": "Chemours",          "ats": "workday", **_wd("chemours",         "wd103", "Chemours")},
+  {"display_name": "Mosaic",          "ats": "workday", **_wd("mosaic",         "wd5", "mosaic")},
+  {"display_name": "CF Industries",          "ats": "workday", **_wd("cfindustries",         "wd1", "careers")},
+   {"display_name": "Koch",      "ats": "avature",
+     "base_url": "https://koch.avature.net",
+     "search_path": "/en_US/careers/",
+     "country_filter": ["US"]},
 
     # ─── Pharma & Biopharma ──────────────────────────────────────────────────
     {"display_name": "Merck (MSD)",        "ats": "workday", **_wd("msd",           "wd5", "SearchJobs")},
